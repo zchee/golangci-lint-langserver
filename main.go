@@ -2,37 +2,54 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"os"
 
-	"github.com/sourcegraph/jsonrpc2"
+	"go.lsp.dev/protocol"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
-var defaultSeverity = "Warn"
+var (
+	noLinterName = flag.Bool("nolintername", false, "don't show a linter name in message")
+	// defaultSeverity = flag.String("severity", protocol.DiagnosticSeverityWarning.String(), "Default severity to use. Choices are: Err(or), Warn(ing), Info(rmation) or Hint")
+)
 
 func main() {
-	debug := flag.Bool("debug", false, "output debug log")
-	noLinterName := flag.Bool("nolintername", false, "don't show a linter name in message")
-	flag.StringVar(&defaultSeverity, "severity", defaultSeverity, "Default severity to use. Choices are: Err(or), Warn(ing), Info(rmation) or Hint")
-
+	l := zap.LevelFlag("loglevel", zapcore.ErrorLevel, "output debug log")
 	flag.Parse()
 
-	logger := newStdLogger(*debug)
+	logger, err := zap.NewDevelopment(zap.IncreaseLevel(l))
+	if err != nil {
+		panic(err)
+	}
+	logger.Info("golangci-lint-langserver: connections opened")
 
-	handler := NewHandler(logger, *noLinterName)
+	if err := run(context.Background(), logger); err != nil {
+		logger.Fatal("run", zap.Error(err))
+	}
 
-	var connOpt []jsonrpc2.ConnOpt
+	logger.Info("golangci-lint-langserver: connections closed")
+}
 
-	logger.Printf("golangci-lint-langserver: connections opened")
+func run(ctx context.Context, logger *zap.Logger) (retErr error) {
+	rwc := stdrwc{}
+	conn := NewConn(rwc, rwc)
+	defer func() {
+		retErr = errors.Join(retErr, conn.Close())
+	}()
 
-	<-jsonrpc2.NewConn(
-		context.Background(),
-		jsonrpc2.NewBufferedStream(stdrwc{}, jsonrpc2.VSCodeObjectCodec{}),
-		handler,
-		connOpt...,
-	).DisconnectNotify()
-
-	logger.Printf("golangci-lint-langserver: connections closed")
+	server := NewServer(ctx, conn, logger, *noLinterName)
+	conn.Go(
+		ctx,
+		protocol.ServerHandler(
+			server,
+			nil,
+		),
+	)
+	<-conn.Done()
+	return nil
 }
 
 type stdrwc struct{}
