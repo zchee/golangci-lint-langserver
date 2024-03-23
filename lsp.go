@@ -1,112 +1,47 @@
 package main
 
-type DocumentURI string
+import (
+	"errors"
+	"io"
+	"os"
 
-type InitializeParams struct {
-	RootURI               string                `json:"rootUri,omitempty"`
-	InitializationOptions InitializationOptions `json:"initializationOptions,omitempty"`
-}
-
-type InitializationOptions struct {
-	Command []string
-}
-
-type InitializeResult struct {
-	Capabilities ServerCapabilities `json:"capabilities,omitempty"`
-}
-
-type TextDocumentSyncKind int
-
-//nolint:unused,deadcode
-const (
-	TDSKNone TextDocumentSyncKind = iota
-	TDSKFull
-	TDSKIncremental
+	"go.lsp.dev/jsonrpc2"
+	"go.lsp.dev/protocol"
 )
 
-type CompletionProvider struct {
-	ResolveProvider   bool     `json:"resolveProvider,omitempty"`
-	TriggerCharacters []string `json:"triggerCharacters"`
+// NewConn returns a new jsonrpc2.Conn backed by the given io.{Read,Write}Closer
+// (which is usually os.Stdin and os.Stdout).
+func NewConn(readCloser io.ReadCloser, writeCloser io.WriteCloser) jsonrpc2.Conn {
+	f, err := os.Open("/Users/zchee/.local/state/nvim/log")
+	if err != nil {
+		panic(err)
+	}
+	stream := jsonrpc2.NewStream(
+		&readWriteCloser{
+			f:           f,
+			readCloser:  readCloser,
+			writeCloser: writeCloser,
+		},
+	)
+	return jsonrpc2.NewConn(
+		protocol.LoggingStream(stream, f),
+	)
 }
 
-type TextDocumentSyncOptions struct {
-	OpenClose         bool                 `json:"openClose,omitempty"`
-	Change            TextDocumentSyncKind `json:"change,omitempty"`
-	WillSave          bool                 `json:"willSave,omitempty"`
-	WillSaveWaitUntil bool                 `json:"willSaveWaitUntil,omitempty"`
-	Save              bool                 `json:"save,omitempty"`
+type readWriteCloser struct {
+	f           *os.File
+	readCloser  io.ReadCloser
+	writeCloser io.WriteCloser
 }
 
-type ServerCapabilities struct {
-	TextDocumentSync           TextDocumentSyncOptions `json:"textDocumentSync,omitempty"`
-	CompletionProvider         *CompletionProvider     `json:"completionProvider,omitempty"`
-	DocumentSymbolProvider     bool                    `json:"documentSymbolProvider,omitempty"`
-	DefinitionProvider         bool                    `json:"definitionProvider,omitempty"`
-	DocumentFormattingProvider bool                    `json:"documentFormattingProvider,omitempty"`
-	HoverProvider              bool                    `json:"hoverProvider,omitempty"`
-	CodeActionProvider         bool                    `json:"codeActionProvider,omitempty"`
+func (r *readWriteCloser) Read(b []byte) (int, error) {
+	return r.readCloser.Read(b)
 }
 
-type TextDocumentItem struct {
-	URI        DocumentURI `json:"uri"`
-	LanguageID string      `json:"languageId"`
-	Version    int         `json:"version"`
-	Text       string      `json:"text"`
+func (r *readWriteCloser) Write(b []byte) (int, error) {
+	return r.writeCloser.Write(b)
 }
 
-type TextDocumentIdentifier struct {
-	URI DocumentURI `json:"uri"`
-}
-
-type DidOpenTextDocumentParams struct {
-	TextDocument TextDocumentItem `json:"textDocument"`
-}
-
-type DidSaveTextDocumentParams struct {
-	Text         *string                `json:"text"`
-	TextDocument TextDocumentIdentifier `json:"textDocument"`
-}
-
-type Location struct {
-	URI   string `json:"uri"`
-	Range Range  `json:"range"`
-}
-
-type Range struct {
-	Start Position `json:"start"`
-	End   Position `json:"end"`
-}
-
-type Position struct {
-	Line      int `json:"line"`
-	Character int `json:"character"`
-}
-
-type DiagnosticRelatedInformation struct {
-	Location Location `json:"location"`
-	Message  string   `json:"message"`
-}
-
-type DiagnosticSeverity int
-
-//nolint:unused,deadcode
-const (
-	DSError DiagnosticSeverity = iota + 1
-	DSWarning
-	DSInformation
-	DSHint
-)
-
-type Diagnostic struct {
-	Range              Range                          `json:"range"`
-	Severity           DiagnosticSeverity             `json:"severity,omitempty"`
-	Code               *string                        `json:"code,omitempty"`
-	Source             *string                        `json:"source,omitempty"`
-	Message            string                         `json:"message"`
-	RelatedInformation []DiagnosticRelatedInformation `json:"relatedInformation,omitempty"`
-}
-
-type PublishDiagnosticsParams struct {
-	URI         DocumentURI  `json:"uri"`
-	Diagnostics []Diagnostic `json:"diagnostics"`
+func (r *readWriteCloser) Close() error {
+	return errors.Join(r.readCloser.Close(), r.writeCloser.Close(), r.f.Close())
 }
