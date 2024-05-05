@@ -17,7 +17,7 @@ var (
 )
 
 func main() {
-	l := zap.LevelFlag("loglevel", zapcore.ErrorLevel, "output debug log")
+	l := zap.LevelFlag("loglevel", zapcore.DebugLevel, "output debug log")
 	flag.Parse()
 
 	logger, err := zap.NewDevelopment(zap.IncreaseLevel(l))
@@ -43,10 +43,10 @@ func run(ctx context.Context, logger *zap.Logger) (retErr error) {
 	server := NewServer(ctx, conn, logger, *noLinterName)
 	conn.Go(
 		ctx,
-		protocol.ServerHandler(
+		protocol.Handlers(protocol.ServerHandler(
 			server,
 			nil,
-		),
+		)),
 	)
 	<-conn.Done()
 	return nil

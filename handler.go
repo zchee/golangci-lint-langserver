@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -12,9 +13,23 @@ import (
 	"github.com/bytedance/sonic"
 	"go.lsp.dev/jsonrpc2"
 	"go.lsp.dev/protocol"
+	pprotocol "go.lsp.dev/protocol/protocol"
 	"go.lsp.dev/uri"
 	"go.uber.org/zap"
 )
+
+func init() {
+	pprotocol.RegiserMarshaler(sonic.ConfigFastest.Marshal)
+	pprotocol.RegiserUnmarshaler(sonic.ConfigFastest.Unmarshal)
+	pprotocol.RegiserEncoder(func(w io.Writer) pprotocol.JSONEncoder {
+		enc := sonic.ConfigFastest.NewEncoder(w)
+		return enc
+	})
+	pprotocol.RegiserDecoder(func(r io.Reader) pprotocol.JSONDecoder {
+		dec := sonic.ConfigFastest.NewDecoder(r)
+		return dec
+	})
+}
 
 type handler struct {
 	protocol.Server
@@ -23,7 +38,7 @@ type handler struct {
 	logger       *zap.Logger
 	noLinterName bool
 
-	request chan protocol.DocumentURI
+	request chan pprotocol.DocumentURI
 	command []string
 	rootURI uri.URI
 	rootDir uri.URI
@@ -34,14 +49,14 @@ func NewServer(ctx context.Context, conn jsonrpc2.Conn, logger *zap.Logger, noLi
 		Conn:         conn,
 		logger:       logger,
 		noLinterName: noLinterName,
-		request:      make(chan protocol.DocumentURI),
+		request:      make(chan pprotocol.DocumentURI),
 	}
 	go handler.linter(ctx)
 
 	return handler
 }
 
-func (h *handler) errToDiagnostics(err error) []protocol.Diagnostic {
+func (h *handler) errToDiagnostics(err error) []pprotocol.Diagnostic {
 	var message string
 	switch e := err.(type) {
 	case *exec.ExitError:
@@ -50,9 +65,9 @@ func (h *handler) errToDiagnostics(err error) []protocol.Diagnostic {
 		h.logger.Debug("golangci-lint-langserver: errToDiagnostics message", zap.String("message", message))
 		message = e.Error()
 	}
-	return []protocol.Diagnostic{
+	return []pprotocol.Diagnostic{
 		{
-			Severity: protocol.DiagnosticSeverityError,
+			Severity: pprotocol.ErrorDiagnosticSeverity,
 			Message:  message,
 		},
 	}
@@ -89,22 +104,22 @@ type Result struct {
 	} `json:"Report"`
 }
 
-func (h *handler) SeverityFromString(severity string) protocol.DiagnosticSeverity {
+func (h *handler) SeverityFromString(severity string) pprotocol.DiagnosticSeverity {
 	switch strings.ToLower(severity) {
 	case "error":
-		return protocol.DiagnosticSeverityError
+		return pprotocol.ErrorDiagnosticSeverity
 	case "warning":
-		return protocol.DiagnosticSeverityWarning
+		return pprotocol.WarningDiagnosticSeverity
 	case "information":
-		return protocol.DiagnosticSeverityInformation
+		return pprotocol.InformationDiagnosticSeverity
 	case "hint":
-		return protocol.DiagnosticSeverityHint
+		return pprotocol.HintDiagnosticSeverity
 	default:
-		return protocol.DiagnosticSeverityWarning
+		return pprotocol.WarningDiagnosticSeverity
 	}
 }
 
-func (h *handler) lint(docURI protocol.DocumentURI) ([]protocol.Diagnostic, error) {
+func (h *handler) lint(docURI pprotocol.DocumentURI) ([]pprotocol.Diagnostic, error) {
 	path := uri.New(string(docURI))
 	dir, file := filepath.Split(path.Filename())
 
@@ -136,20 +151,20 @@ func (h *handler) lint(docURI protocol.DocumentURI) ([]protocol.Diagnostic, erro
 
 	h.logger.Debug("golangci-lint-langserver: golingci-lint", zap.Any("result", result))
 
-	diagnostics := make([]protocol.Diagnostic, 0, len(result.Issues))
+	diagnostics := make([]pprotocol.Diagnostic, 0, len(result.Issues))
 	for _, issue := range result.Issues {
 		issue := issue
 		if file != issue.Pos.Filename {
 			continue
 		}
 
-		d := protocol.Diagnostic{
-			Range: protocol.Range{
-				Start: protocol.Position{
+		d := pprotocol.Diagnostic{
+			Range: pprotocol.Range{
+				Start: pprotocol.Position{
 					Line:      uint32(max(int(issue.Pos.Line-1), 0)),
 					Character: uint32(max(int(issue.Pos.Column-1), 0)),
 				},
-				End: protocol.Position{
+				End: pprotocol.Position{
 					Line:      uint32(max(int(issue.Pos.Line-1), 0)),
 					Character: uint32(max(int(issue.Pos.Column-1), 0)),
 				},
@@ -185,12 +200,13 @@ func (h *handler) linter(ctx context.Context) {
 
 			continue
 		}
+		h.logger.Debug("linter", zap.Any("diagnostics", diagnostics))
 
 		if err := h.Conn.Notify(
 			ctx,
-			protocol.MethodTextDocumentPublishDiagnostics,
-			&protocol.PublishDiagnosticsParams{
-				URI:         u,
+			pprotocol.MethodTextDocumentPublishDiagnostics,
+			&pprotocol.PublishDiagnosticsParams{
+				URI:         pprotocol.DocumentURI(u),
 				Diagnostics: diagnostics,
 			}); err != nil {
 			h.logger.Fatal("notify", zap.Error(err))
@@ -198,7 +214,7 @@ func (h *handler) linter(ctx context.Context) {
 	}
 }
 
-func (h *handler) Initialize(ctx context.Context, params *protocol.InitializeParams) (*protocol.InitializeResult, error) {
+func (h *handler) Initialize(_ context.Context, params *protocol.InitializeParams) (*protocol.InitializeResult, error) {
 	h.rootURI = uri.New(params.WorkspaceFolders[0].URI)
 	h.rootDir = uri.New(params.WorkspaceFolders[0].URI)
 	initOptions := params.InitializationOptions.(map[string]any)
@@ -210,15 +226,16 @@ func (h *handler) Initialize(ctx context.Context, params *protocol.InitializePar
 		h.command = []string{"golangci-lint", "run", "--out-format", "json"}
 	}
 
+	textDocumentSync := pprotocol.NewServerCapabilitiesTextDocumentSync(pprotocol.TextDocumentSyncOptions{
+		Change:    pprotocol.NoneTextDocumentSyncKind,
+		OpenClose: true,
+		Save: pprotocol.NewTextDocumentSyncOptionsSave(pprotocol.SaveOptions{
+			IncludeText: true,
+		}),
+	})
 	return &protocol.InitializeResult{
 		Capabilities: protocol.ServerCapabilities{
-			TextDocumentSync: protocol.TextDocumentSyncOptions{
-				Change:    protocol.TextDocumentSyncKindNone,
-				OpenClose: true,
-				Save: &protocol.SaveOptions{
-					IncludeText: true,
-				},
-			},
+			TextDocumentSync: textDocumentSync,
 		},
 		ServerInfo: &protocol.ServerInfo{
 			Name: "golangci-lint-langserver",
@@ -232,231 +249,307 @@ func (h *handler) Shutdown(context.Context) (err error) {
 }
 
 func (h *handler) DidOpen(_ context.Context, params *protocol.DidOpenTextDocumentParams) (err error) {
-	h.request <- params.TextDocument.URI
+	h.request <- pprotocol.DocumentURI(params.TextDocument.URI)
 	return nil
 }
 
 func (h *handler) DidSave(_ context.Context, params *protocol.DidSaveTextDocumentParams) (err error) {
-	h.request <- params.TextDocument.URI
+	h.request <- pprotocol.DocumentURI(params.TextDocument.URI)
 	return nil
 }
 
 func (h *handler) WillSave(ctx context.Context, params *protocol.WillSaveTextDocumentParams) error {
-	h.request <- params.TextDocument.URI
+	h.request <- pprotocol.DocumentURI(params.TextDocument.URI)
 	return nil
 }
 
-func (h *handler) Initialized(ctx context.Context, params *protocol.InitializedParams) error {
-	return nil
+func (*handler) CancelRequest(ctx context.Context, params *protocol.CancelParams) error {
+	return jsonrpc2.ErrInternal
 }
 
-func (h *handler) Exit(ctx context.Context) error {
-	return nil
+func (*handler) Progress(ctx context.Context, params *protocol.ProgressParams) error {
+	return jsonrpc2.ErrInternal
 }
 
-func (h *handler) WorkDoneProgressCancel(ctx context.Context, params *protocol.WorkDoneProgressCancelParams) error {
-	return errors.New("unimplemented")
+func (*handler) SetTrace(ctx context.Context, params *protocol.SetTraceParams) error {
+	return jsonrpc2.ErrInternal
 }
 
-func (h *handler) LogTrace(ctx context.Context, params *protocol.LogTraceParams) error {
-	return errors.New("unimplemented")
+func (*handler) Exit(ctx context.Context) error {
+	return jsonrpc2.ErrInternal
 }
 
-func (h *handler) SetTrace(ctx context.Context, params *protocol.SetTraceParams) error {
-	return errors.New("unimplemented")
+func (*handler) Initialized(ctx context.Context, params *protocol.InitializedParams) error {
+	return jsonrpc2.ErrInternal
 }
 
-func (h *handler) CodeAction(ctx context.Context, params *protocol.CodeActionParams) ([]protocol.CodeAction, error) {
-	return nil, errors.New("unimplemented")
+// func (*handler) NotebookDocumentDidChange(ctx context.Context, params *protocol.DidChangeNotebookDocumentParams) error {
+// 	return jsonrpc2.ErrInternal
+// }
+//
+// func (*handler) NotebookDocumentDidClose(ctx context.Context, params *protocol.DidCloseNotebookDocumentParams) error {
+// 	return jsonrpc2.ErrInternal
+// }
+//
+// func (*handler) NotebookDocumentDidOpen(ctx context.Context, params *protocol.DidOpenNotebookDocumentParams) error {
+// 	return jsonrpc2.ErrInternal
+// }
+//
+// func (*handler) NotebookDocumentDidSave(ctx context.Context, params *protocol.DidSaveNotebookDocumentParams) error {
+// 	return jsonrpc2.ErrInternal
+// }
+
+func (*handler) TextDocumentDidChange(ctx context.Context, params *protocol.DidChangeTextDocumentParams) error {
+	return jsonrpc2.ErrInternal
 }
 
-func (h *handler) CodeLens(ctx context.Context, params *protocol.CodeLensParams) ([]protocol.CodeLens, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) TextDocumentDidClose(ctx context.Context, params *protocol.DidCloseTextDocumentParams) error {
+	return jsonrpc2.ErrInternal
 }
 
-func (h *handler) CodeLensResolve(ctx context.Context, params *protocol.CodeLens) (*protocol.CodeLens, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) TextDocumentDidOpen(ctx context.Context, params *protocol.DidOpenTextDocumentParams) error {
+	return jsonrpc2.ErrInternal
 }
 
-func (h *handler) ColorPresentation(ctx context.Context, params *protocol.ColorPresentationParams) ([]protocol.ColorPresentation, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) TextDocumentDidSave(ctx context.Context, params *protocol.DidSaveTextDocumentParams) error {
+	return jsonrpc2.ErrInternal
 }
 
-func (h *handler) Completion(ctx context.Context, params *protocol.CompletionParams) (*protocol.CompletionList, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) TextDocumentWillSave(ctx context.Context, params *protocol.WillSaveTextDocumentParams) error {
+	return jsonrpc2.ErrInternal
 }
 
-func (h *handler) CompletionResolve(ctx context.Context, params *protocol.CompletionItem) (*protocol.CompletionItem, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) WindowWorkDoneProgressCancel(ctx context.Context, params *protocol.WorkDoneProgressCancelParams) error {
+	return jsonrpc2.ErrInternal
 }
 
-func (h *handler) Declaration(ctx context.Context, params *protocol.DeclarationParams) ([]protocol.Location, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) WorkspaceDidChangeConfiguration(ctx context.Context, params *protocol.DidChangeConfigurationParams) error {
+	return jsonrpc2.ErrInternal
 }
 
-func (h *handler) DidChange(ctx context.Context, params *protocol.DidChangeTextDocumentParams) error {
-	return errors.New("unimplemented")
+func (*handler) WorkspaceDidChangeWatchedFiles(ctx context.Context, params *protocol.DidChangeWatchedFilesParams) error {
+	return jsonrpc2.ErrInternal
 }
 
-func (h *handler) DidChangeConfiguration(ctx context.Context, params *protocol.DidChangeConfigurationParams) error {
-	return errors.New("unimplemented")
+func (*handler) WorkspaceDidChangeWorkspaceFolders(ctx context.Context, params *protocol.DidChangeWorkspaceFoldersParams) error {
+	return jsonrpc2.ErrInternal
 }
 
-func (h *handler) DidChangeWatchedFiles(ctx context.Context, params *protocol.DidChangeWatchedFilesParams) error {
-	return errors.New("unimplemented")
+func (*handler) WorkspaceDidCreateFiles(ctx context.Context, params *protocol.CreateFilesParams) error {
+	return jsonrpc2.ErrInternal
 }
 
-func (h *handler) DidChangeWorkspaceFolders(ctx context.Context, params *protocol.DidChangeWorkspaceFoldersParams) error {
-	return errors.New("unimplemented")
+func (*handler) WorkspaceDidDeleteFiles(ctx context.Context, params *protocol.DeleteFilesParams) error {
+	return jsonrpc2.ErrInternal
 }
 
-func (h *handler) DidClose(ctx context.Context, params *protocol.DidCloseTextDocumentParams) error {
-	return errors.New("unimplemented")
+func (*handler) WorkspaceDidRenameFiles(ctx context.Context, params *protocol.RenameFilesParams) error {
+	return jsonrpc2.ErrInternal
 }
 
-func (h *handler) DocumentColor(ctx context.Context, params *protocol.DocumentColorParams) ([]protocol.ColorInformation, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) CallHierarchyIncomingCalls(ctx context.Context, params *protocol.CallHierarchyIncomingCallsParams) ([]*protocol.CallHierarchyIncomingCall, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) DocumentHighlight(ctx context.Context, params *protocol.DocumentHighlightParams) ([]protocol.DocumentHighlight, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) CallHierarchyOutgoingCalls(ctx context.Context, params *protocol.CallHierarchyOutgoingCallsParams) ([]*protocol.CallHierarchyOutgoingCall, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) DocumentLink(ctx context.Context, params *protocol.DocumentLinkParams) ([]protocol.DocumentLink, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) CodeActionResolve(ctx context.Context, params *protocol.CodeAction) (*protocol.CodeAction, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) DocumentLinkResolve(ctx context.Context, params *protocol.DocumentLink) (*protocol.DocumentLink, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) CodeLensResolve(ctx context.Context, params *protocol.CodeLens) (*protocol.CodeLens, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) DocumentSymbol(ctx context.Context, params *protocol.DocumentSymbolParams) ([]interface{}, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) CompletionItemResolve(ctx context.Context, params *protocol.CompletionItem) (*protocol.CompletionItem, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) ExecuteCommand(ctx context.Context, params *protocol.ExecuteCommandParams) (interface{}, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) DocumentLinkResolve(ctx context.Context, params *protocol.DocumentLink) (*protocol.DocumentLink, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) FoldingRanges(ctx context.Context, params *protocol.FoldingRangeParams) ([]protocol.FoldingRange, error) {
-	return nil, errors.New("unimplemented")
+// func (*handler) InlayHintResolve(ctx context.Context, params *protocol.InlayHint) (*protocol.InlayHint, error) {
+// 	return nil, jsonrpc2.ErrInternal
+// }
+
+// func (*handler) TextDocumentCodeAction(ctx context.Context, params *protocol.CodeActionParams) (*protocol.TextDocumentCodeActionResult, error) {
+// 	return nil, jsonrpc2.ErrInternal
+// }
+
+func (*handler) TextDocumentCodeLens(ctx context.Context, params *protocol.CodeLensParams) ([]*protocol.CodeLens, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) Formatting(ctx context.Context, params *protocol.DocumentFormattingParams) ([]protocol.TextEdit, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) TextDocumentColorPresentation(ctx context.Context, params *protocol.ColorPresentationParams) ([]*protocol.ColorPresentation, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) Hover(ctx context.Context, params *protocol.HoverParams) (*protocol.Hover, error) {
-	return nil, errors.New("unimplemented")
+// func (*handler) TextDocumentCompletion(ctx context.Context, params *protocol.CompletionParams) (*protocol.TextDocumentCompletionResult, error) {
+// 	return nil, jsonrpc2.ErrInternal
+// }
+//
+// func (*handler) TextDocumentDeclaration(ctx context.Context, params *protocol.DeclarationParams) (*protocol.TextDocumentDeclarationResult, error) {
+// 	return nil, jsonrpc2.ErrInternal
+// }
+//
+// func (*handler) TextDocumentDefinition(ctx context.Context, params *protocol.DefinitionParams) (*protocol.TextDocumentDefinitionResult, error) {
+// 	return nil, jsonrpc2.ErrInternal
+// }
+//
+// func (*handler) TextDocumentDiagnostic(ctx context.Context, params *protocol.DocumentDiagnosticParams) (*protocol.DocumentDiagnosticReport, error) {
+// 	return nil, jsonrpc2.ErrInternal
+// }
+
+func (*handler) TextDocumentDocumentColor(ctx context.Context, params *protocol.DocumentColorParams) ([]*protocol.ColorInformation, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) Implementation(ctx context.Context, params *protocol.ImplementationParams) ([]protocol.Location, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) TextDocumentDocumentHighlight(ctx context.Context, params *protocol.DocumentHighlightParams) ([]*protocol.DocumentHighlight, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) OnTypeFormatting(ctx context.Context, params *protocol.DocumentOnTypeFormattingParams) ([]protocol.TextEdit, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) TextDocumentDocumentLink(ctx context.Context, params *protocol.DocumentLinkParams) ([]*protocol.DocumentLink, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) PrepareRename(ctx context.Context, params *protocol.PrepareRenameParams) (*protocol.Range, error) {
-	return nil, errors.New("unimplemented")
+// func (*handler) TextDocumentDocumentSymbol(ctx context.Context, params *protocol.DocumentSymbolParams) (*protocol.TextDocumentDocumentSymbolResult, error) {
+// 	return nil, jsonrpc2.ErrInternal
+// }
+
+func (*handler) TextDocumentFoldingRange(ctx context.Context, params *protocol.FoldingRangeParams) ([]*protocol.FoldingRange, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) RangeFormatting(ctx context.Context, params *protocol.DocumentRangeFormattingParams) ([]protocol.TextEdit, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) TextDocumentFormatting(ctx context.Context, params *protocol.DocumentFormattingParams) ([]*protocol.TextEdit, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) References(ctx context.Context, params *protocol.ReferenceParams) ([]protocol.Location, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) TextDocumentHover(ctx context.Context, params *protocol.HoverParams) (*protocol.Hover, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) Rename(ctx context.Context, params *protocol.RenameParams) (*protocol.WorkspaceEdit, error) {
-	return nil, errors.New("unimplemented")
+// func (*handler) TextDocumentImplementation(ctx context.Context, params *protocol.ImplementationParams) (*protocol.TextDocumentImplementationResult, error) {
+// 	return nil, jsonrpc2.ErrInternal
+// }
+//
+// func (*handler) TextDocumentInlayHint(ctx context.Context, params *protocol.InlayHintParams) ([]*protocol.InlayHint, error) {
+// 	return nil, jsonrpc2.ErrInternal
+// }
+//
+// func (*handler) TextDocumentInlineCompletion(ctx context.Context, params *protocol.InlineCompletionParams) (*protocol.TextDocumentInlineCompletionResult, error) {
+// 	return nil, jsonrpc2.ErrInternal
+// }
+//
+// func (*handler) TextDocumentInlineValue(ctx context.Context, params *protocol.InlineValueParams) ([]*protocol.InlineValue, error) {
+// 	return nil, jsonrpc2.ErrInternal
+// }
+
+func (*handler) TextDocumentLinkedEditingRange(ctx context.Context, params *protocol.LinkedEditingRangeParams) (*protocol.LinkedEditingRanges, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) SignatureHelp(ctx context.Context, params *protocol.SignatureHelpParams) (*protocol.SignatureHelp, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) TextDocumentMoniker(ctx context.Context, params *protocol.MonikerParams) ([]*protocol.Moniker, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) Symbols(ctx context.Context, params *protocol.WorkspaceSymbolParams) ([]protocol.SymbolInformation, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) TextDocumentOnTypeFormatting(ctx context.Context, params *protocol.DocumentOnTypeFormattingParams) ([]*protocol.TextEdit, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) TypeDefinition(ctx context.Context, params *protocol.TypeDefinitionParams) ([]protocol.Location, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) TextDocumentPrepareCallHierarchy(ctx context.Context, params *protocol.CallHierarchyPrepareParams) ([]*protocol.CallHierarchyItem, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) WillSaveWaitUntil(ctx context.Context, params *protocol.WillSaveTextDocumentParams) ([]protocol.TextEdit, error) {
-	return nil, errors.New("unimplemented")
+// func (*handler) TextDocumentPrepareRename(ctx context.Context, params *protocol.PrepareRenameParams) (*protocol.PrepareRenameResult, error) {
+// 	return nil, jsonrpc2.ErrInternal
+// }
+//
+// func (*handler) TextDocumentPrepareTypeHierarchy(ctx context.Context, params *protocol.TypeHierarchyPrepareParams) ([]*protocol.TypeHierarchyItem, error) {
+// 	return nil, jsonrpc2.ErrInternal
+// }
+
+func (*handler) TextDocumentRangeFormatting(ctx context.Context, params *protocol.DocumentRangeFormattingParams) ([]*protocol.TextEdit, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) ShowDocument(ctx context.Context, params *protocol.ShowDocumentParams) (*protocol.ShowDocumentResult, error) {
-	return nil, errors.New("unimplemented")
+// func (*handler) TextDocumentRangesFormatting(ctx context.Context, params *protocol.DocumentRangesFormattingParams) ([]*protocol.TextEdit, error) {
+// 	return nil, jsonrpc2.ErrInternal
+// }
+
+func (*handler) TextDocumentReferences(ctx context.Context, params *protocol.ReferenceParams) ([]*protocol.Location, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) WillCreateFiles(ctx context.Context, params *protocol.CreateFilesParams) (*protocol.WorkspaceEdit, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) TextDocumentRename(ctx context.Context, params *protocol.RenameParams) (*protocol.WorkspaceEdit, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) DidCreateFiles(ctx context.Context, params *protocol.CreateFilesParams) error {
-	return errors.New("unimplemented")
+func (*handler) TextDocumentSelectionRange(ctx context.Context, params *protocol.SelectionRangeParams) ([]*protocol.SelectionRange, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) WillRenameFiles(ctx context.Context, params *protocol.RenameFilesParams) (*protocol.WorkspaceEdit, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) TextDocumentSemanticTokensFull(ctx context.Context, params *protocol.SemanticTokensParams) (*protocol.SemanticTokens, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) DidRenameFiles(ctx context.Context, params *protocol.RenameFilesParams) error {
-	return errors.New("unimplemented")
+// func (*handler) TextDocumentSemanticTokensFullDelta(ctx context.Context, params *protocol.SemanticTokensDeltaParams) (*protocol.TextDocumentSemanticTokensFullDeltaResult, error) {
+// 	return nil, jsonrpc2.ErrInternal
+// }
+
+func (*handler) TextDocumentSemanticTokensRange(ctx context.Context, params *protocol.SemanticTokensRangeParams) (*protocol.SemanticTokens, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) WillDeleteFiles(ctx context.Context, params *protocol.DeleteFilesParams) (*protocol.WorkspaceEdit, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) TextDocumentSignatureHelp(ctx context.Context, params *protocol.SignatureHelpParams) (*protocol.SignatureHelp, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) DidDeleteFiles(ctx context.Context, params *protocol.DeleteFilesParams) error {
-	return errors.New("unimplemented")
+// func (*handler) TextDocumentTypeDefinition(ctx context.Context, params *protocol.TypeDefinitionParams) (*protocol.TextDocumentTypeDefinitionResult, error) {
+// 	return nil, jsonrpc2.ErrInternal
+// }
+
+func (*handler) TextDocumentWillSaveWaitUntil(ctx context.Context, params *protocol.WillSaveTextDocumentParams) ([]*protocol.TextEdit, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) CodeLensRefresh(ctx context.Context) error {
-	return errors.New("unimplemented")
+// func (*handler) TypeHierarchySubtypes(ctx context.Context, params *protocol.TypeHierarchySubtypesParams) ([]*protocol.TypeHierarchyItem, error) {
+// 	return nil, jsonrpc2.ErrInternal
+// }
+//
+// func (*handler) TypeHierarchySupertypes(ctx context.Context, params *protocol.TypeHierarchySupertypesParams) ([]*protocol.TypeHierarchyItem, error) {
+// 	return nil, jsonrpc2.ErrInternal
+// }
+//
+// func (*handler) WorkspaceDiagnostic(ctx context.Context, params *protocol.WorkspaceDiagnosticParams) (*protocol.WorkspaceDiagnosticReport, error) {
+// 	return nil, jsonrpc2.ErrInternal
+// }
+
+func (*handler) WorkspaceExecuteCommand(ctx context.Context, params *protocol.ExecuteCommandParams) (any, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) PrepareCallHierarchy(ctx context.Context, params *protocol.CallHierarchyPrepareParams) ([]protocol.CallHierarchyItem, error) {
-	return nil, errors.New("unimplemented")
+// func (*handler) WorkspaceSymbol(ctx context.Context, params *protocol.WorkspaceSymbolParams) (*protocol.WorkspaceSymbolResult, error) {
+// 	return nil, jsonrpc2.ErrInternal
+// }
+
+func (*handler) WorkspaceWillCreateFiles(ctx context.Context, params *protocol.CreateFilesParams) (*protocol.WorkspaceEdit, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) IncomingCalls(ctx context.Context, params *protocol.CallHierarchyIncomingCallsParams) ([]protocol.CallHierarchyIncomingCall, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) WorkspaceWillDeleteFiles(ctx context.Context, params *protocol.DeleteFilesParams) (*protocol.WorkspaceEdit, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) OutgoingCalls(ctx context.Context, params *protocol.CallHierarchyOutgoingCallsParams) ([]protocol.CallHierarchyOutgoingCall, error) {
-	return nil, errors.New("unimplemented")
+func (*handler) WorkspaceWillRenameFiles(ctx context.Context, params *protocol.RenameFilesParams) (*protocol.WorkspaceEdit, error) {
+	return nil, jsonrpc2.ErrInternal
 }
 
-func (h *handler) SemanticTokensFull(ctx context.Context, params *protocol.SemanticTokensParams) (*protocol.SemanticTokens, error) {
-	return nil, errors.New("unimplemented")
-}
-
-func (h *handler) SemanticTokensFullDelta(ctx context.Context, params *protocol.SemanticTokensDeltaParams) (interface{}, error) {
-	return nil, errors.New("unimplemented")
-}
-
-func (h *handler) SemanticTokensRange(ctx context.Context, params *protocol.SemanticTokensRangeParams) (*protocol.SemanticTokens, error) {
-	return nil, errors.New("unimplemented")
-}
-
-func (h *handler) SemanticTokensRefresh(ctx context.Context) error {
-	return errors.New("unimplemented")
-}
-
-func (h *handler) LinkedEditingRange(ctx context.Context, params *protocol.LinkedEditingRangeParams) (*protocol.LinkedEditingRanges, error) {
-	return nil, errors.New("unimplemented")
-}
-
-func (h *handler) Moniker(ctx context.Context, params *protocol.MonikerParams) ([]protocol.Moniker, error) {
-	return nil, errors.New("unimplemented")
-}
+// func (*handler) WorkspaceSymbolResolve(ctx context.Context, params *protocol.WorkspaceSymbol) (*protocol.WorkspaceSymbol, error) {
+// 	return nil, jsonrpc2.ErrInternal
+// }
 
 func (h *handler) Request(ctx context.Context, method string, params interface{}) (interface{}, error) {
 	return nil, errors.New("unimplemented")
