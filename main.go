@@ -17,20 +17,20 @@ var (
 )
 
 func main() {
-	l := zap.LevelFlag("loglevel", zapcore.ErrorLevel, "output debug log")
+	l := zap.LevelFlag("loglevel", zapcore.DebugLevel, "output debug log")
 	flag.Parse()
 
 	logger, err := zap.NewDevelopment(zap.IncreaseLevel(l))
 	if err != nil {
 		panic(err)
 	}
-	logger.Info("golangci-lint-langserver: connections opened")
+	// logger.Info("golangci-lint-langserver: connections opened")
 
 	if err := run(context.Background(), logger); err != nil {
 		logger.Fatal("run", zap.Error(err))
 	}
 
-	logger.Info("golangci-lint-langserver: connections closed")
+	// logger.Info("golangci-lint-langserver: connections closed")
 }
 
 func run(ctx context.Context, logger *zap.Logger) (retErr error) {
@@ -43,10 +43,10 @@ func run(ctx context.Context, logger *zap.Logger) (retErr error) {
 	server := NewServer(ctx, conn, logger, *noLinterName)
 	conn.Go(
 		ctx,
-		protocol.ServerHandler(
+		protocol.Handlers(protocol.ServerHandler(
 			server,
 			nil,
-		),
+		)),
 	)
 	<-conn.Done()
 	return nil

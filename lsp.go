@@ -3,13 +3,15 @@ package main
 import (
 	"errors"
 	"io"
+	"os"
 
 	"go.lsp.dev/jsonrpc2"
+	"go.lsp.dev/protocol"
 )
 
 // NewConn returns a new jsonrpc2.Conn backed by the given io.{Read,Write}Closer
 // (which is usually os.Stdin and os.Stdout).
-func NewConn(readCloser io.ReadCloser, writeCloser io.WriteCloser) jsonrpc2.Conn {
+func _NewConn(readCloser io.ReadCloser, writeCloser io.WriteCloser) jsonrpc2.Conn {
 	return jsonrpc2.NewConn(
 		jsonrpc2.NewStream(
 			&readWriteCloser{
@@ -20,7 +22,26 @@ func NewConn(readCloser io.ReadCloser, writeCloser io.WriteCloser) jsonrpc2.Conn
 	)
 }
 
+// NewConn returns a new jsonrpc2.Conn backed by the given io.{Read,Write}Closer
+// (which is usually os.Stdin and os.Stdout).
+func NewConn(readCloser io.ReadCloser, writeCloser io.WriteCloser) jsonrpc2.Conn {
+	f, err := os.Create("/Users/zchee/.local/state/nvim/golangci.log")
+	if err != nil {
+		panic(err)
+	}
+	stream := jsonrpc2.NewStream(
+		&readWriteCloser{
+			f:           f,
+			readCloser:  readCloser,
+			writeCloser: writeCloser,
+		},
+	)
+	return jsonrpc2.NewConn(
+		protocol.LoggingStream(stream, f))
+}
+
 type readWriteCloser struct {
+	f           *os.File
 	readCloser  io.ReadCloser
 	writeCloser io.WriteCloser
 }
@@ -34,5 +55,5 @@ func (r *readWriteCloser) Write(b []byte) (int, error) {
 }
 
 func (r *readWriteCloser) Close() error {
-	return errors.Join(r.readCloser.Close(), r.writeCloser.Close())
+	return errors.Join(r.readCloser.Close(), r.writeCloser.Close(), r.f.Close())
 }
